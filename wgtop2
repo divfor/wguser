@@ -1,0 +1,2 @@
+#!/bin/bash
+/usr/local/bin/mmwatch.py "wg show wg0 dump | grep -v none | cut -f 4,6,7"
