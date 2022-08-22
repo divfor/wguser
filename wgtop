@@ -1,0 +1,5 @@
+#!/bin/bash
+#watch -cd "wg show wg0 transfer |paste allowed.ips - |awk '{if(\$NF>0)print}'"
+#/usr/local/bin/mmwatch "wg show wg0 dump | grep -v none | cut -f 4,6,7"
+#watch -cd "wg show wg0 dump |grep -v none |awk '{ printf(\"%s %s\t%ld %ld %ld\n\",\$4,\$3,\$5/1024,\$6/1024,\$7/1024) }'"
+watch -cd "wg show wg0 transfer | grep -v 0$ | sed -f /etc/wireguard/list_users.var"
