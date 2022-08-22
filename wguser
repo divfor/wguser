@@ -1,0 +1,150 @@
+#!/bin/bash
+wgdir=/etc/wireguard
+wanif="$(ip route show default | awk '{if($4=="dev")print $5}')"
+limit_pps=10000
+peer_subnet="10.50.0"
+dns_server="8.8.8.8,1.1.1.1"
+endpoint="<wgserver_ip_or_hostname:wg_port>"
+allowed_ips="0.0.0.0/0,::/0"
+
+get_new_ip(){ # $1: used_in_subnet.var filename
+  i=0; while ((++i<255)); do d[$i]=0; done
+  while read j; do d[$j]=1; done < $1
+  i=10; while ((++i<255)); do [ ${d[$i]} == 0 ] && { d[$i]=1; break; }; done
+  echo $i >> $1
+  echo $i
+}
+
+reset_cfg(){ # Reuse exisiting private key
+  wgif=${1:-"wg0"}
+  cd $wgdir || { echo "Reset - path not found: $wgdir"; exit 1; }
+  [ -s server_private.key ] ||  wg genkey > server_private.key
+  cat server_private.key | wg pubkey > server_public.key
+  echo 1 > used_in_subnet.var
+  [ -s ${wgif}.conf.header ] && cat ${wgif}.conf.header > ${wgif}.conf && return 0
+  # Create wg0.conf.header and *.var files
+  echo "$allowed_ips" |sed 's/,/\n/g' > allowed_ips.var
+  echo "$endpoint" > endpoint.var
+  echo "$peer_subnet" > subnet.var
+  echo "$dns_server" > dns.var
+  echo "$wanif" > ifname.var
+  echo "$limit_pps" > limit_pps.var
+  fwdc="${wgif^^}FWD"
+  pps=$(<limit_pps.var)
+  cat > ${wgif}.conf.header <<- EOF
+        [Interface]
+        Address = $(<subnet.var).1
+        SaveConfig = false
+        PrivateKey = $(<server_private.key)
+        ListenPort = $(cut -d: -f2 <endpoint.var)
+        PostUp = iptables -N $fwdc &>/dev/null; iptables -F $fwdc;
+        PostUp = iptables -A $fwdc -m limit --limit $pps/sec --limit-burst $pps -j ACCEPT;
+        PostUp = iptables -A $fwdc -j DROP;
+        PostUp = iptables-save | grep -q "FORWARD -i %i -j $fwdc" || iptables -A FORWARD -i %i -j $fwdc;
+        PostUp = iptables-save | grep -q "FORWARD -o %i -j $fwdc" || iptables -A FORWARD -o %i -j $fwdc;
+        PostUp = iptables-save | grep -q "POSTROUTING -o $wanif -j MASQUERADE" || iptables -t nat -A POSTROUTING -o $wanif -j MASQUERADE;
+        PostDown = iptables -D FORWARD -i %i -j $fwdc &>/dev/null || echo;
+        PostDown = iptables -D FORWARD -o %i -j $fwdc &>/dev/null || echo;
+        PostDown = iptables -t nat -D POSTROUTING -o $wanif -j MASQUERADE &>/dev/null || echo;
+        PostDown = iptables -F $fwdc &>/dev/null; iptables -X $fwdc &>/dev/null;
+        EOF
+  cat ${wgif}.conf.header > ${wgif}.conf
+}
+
+list_wg_users(){
+  cd $wgdir
+  for f in clients/*.conf; do
+    username=$(basename $f) username=${username%.conf}
+    user_key=$(awk '/PrivateKey/{print $NF}' $f)
+    user_pub=$(echo $user_key | wg pubkey)
+    userip=$(awk '/Address/{print $NF}' $f)
+    userip=${userip%/32}
+    user_in_cfg=$(grep -q "$user_pub" wg0.conf && echo yes || echo no)
+    user_loaded=$(wg show wg0 2>/dev/null | grep -q "$user_pub" && echo yes || echo no)
+    echo "cfg:$user_in_cfg loaded:$user_loaded $user_pub $userip $username"
+  done
+}
+
+del_wg_user(){ # $1:username
+  usercfg="$wgdir/clients/${1}.conf"
+  cd $wgdir || { echo "Path not found: $wgdir"; exit 1; }
+  [ -f "$usercfg" ] || { echo "File already deleted: $usercfg"; exit 2; }
+  userip=$(awk '/Address/{print $NF}' $usercfg)
+  userip=${userip%/32}
+  ipnum=${userip##*.}
+  ipexpr=${userip//./\\.}
+  n=$(awk "/${ipexpr}\//{print NR}" $wgdir/wg0.conf)
+  sed -i "/$ipnum/d" $wgdir/used_in_subnet.var
+  sed -i "$((n-4)),+4d" $wgdir/wg0.conf
+  rm -rf $usercfg
+  echo "removed peer $userip from $wgdir/wg0.conf and deleted $usercfg"
+}
+
+add_wg_user(){ # $1:username
+  usercfg="$wgdir/clients/${1}.conf"
+  cd $wgdir || { echo "Path not found: $wgdir"; exit 1; }
+  [ -d clients ] || mkdir -p clients
+  [ -f "$usercfg" ] && { echo "Found old $usercfg: run 'wguser del $1' to remove it."; exit 1; }
+  share_key=$(wg genpsk)
+  user_key=$(wg genkey)
+  user_pub=$(echo $user_key | wg pubkey)
+  user_ip="$(<subnet.var).$(get_new_ip used_in_subnet.var)/32"
+  # Create new config in override mode
+  cat > $usercfg <<- EOF
+        [Interface]
+        PrivateKey = $user_key
+        Address = $user_ip
+        DNS = $(<dns.var)
+        $(echo)
+        [Peer]
+        PublicKey = $(<server_public.key)
+        PresharedKey = $share_key
+        AllowedIPs = $(paste -sd, <allowed_ips.var)
+        Endpoint = $(<endpoint.var)
+        PersistentKeepalive = 25
+        EOF
+  # Add peer section to the wg0.conf if not present
+  grep -q "$user_pub" wg0.conf || \
+  cat >> wg0.conf <<- EOF
+        $(echo)
+        [Peer]
+        PublicKey = $user_pub
+        PresharedKey = $share_key
+        AllowedIPs = $user_ip
+        EOF
+  list_wg_users | awk '{print "s#\\("$3"\\)#\\1 "$4" "$5"#g"}' > list_users.var
+  echo "# Show QR config to display"
+  qrencode -t ansiutf8 < $usercfg
+  echo "# To save QR config to png file:"
+  echo "qrencode -t png -o ${usercfg/.conf/.png} < $usercfg"
+  echo
+  echo "# Display $usercfg"
+  cat $usercfg
+}
+
+
+[ -z "$1" ] && { echo "Usage: $0 add|del|list <username>"; exit 1; }
+action=$1 username=$2
+[ -d "$wgdir" ] || mkdir -p $wgdir
+cd $wgdir
+
+if [ "$action" == "add" ]; then
+  [ -z "$username" ] && { echo "User name required, Exit."; exit 1; }
+  # Reset wg0.conf if no server_public.key file
+  [ -s server_public.key ] || reset_cfg
+  add_wg_user "$username"
+elif [ "$action" == "del" ]; then
+  [ -z "$username" ] && { echo "User name required, Exit."; exit 1; }
+  del_wg_user "$username"
+elif [ "$action" == "list" ]; then
+  list_wg_users
+  exit 0
+else
+  echo "Usage: $0 add|del|list <username>"
+  exit 1
+fi
+
+echo
+echo Tips:
+echo "reload: wg syncconf wg0 <(wg-quick strip wg0)"
+echo "restart: systemctl restart wg-quick@wg0"
